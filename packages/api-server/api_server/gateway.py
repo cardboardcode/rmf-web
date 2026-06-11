@@ -33,7 +33,7 @@ from rmf_task_msgs.msg import Alert as RmfAlert
 from rmf_task_msgs.msg import AlertResponse as RmfAlertResponse
 from rosidl_runtime_py.convert import message_to_ordereddict
 from std_msgs.msg import Bool as BoolMsg
-from tortoise.exceptions import IntegrityError
+from tortoise.exceptions import IntegrityError, ProgrammingError
 
 from api_server.exceptions import AlreadyExistsError, InvalidInputError, NotFoundError
 from api_server.fast_io.singleton_dep import singleton_dep
@@ -86,6 +86,16 @@ class RmfGateway:
         self._loop = loop
         self._logger = logger or logging.getLogger()
 
+        # ----------------------------
+        # lifecycle state (IMPORTANT)
+        # ----------------------------
+        self._tasks: set[asyncio.Task] = set()
+        self._subscriptions: list[Subscription] = []
+        self._closing = False
+
+        # ----------------------------
+        # publishers
+        # ----------------------------
         self._door_req = self._ros_node.create_publisher(
             RmfDoorRequest, "adapter_door_requests", 10
         )
@@ -145,197 +155,199 @@ class RmfGateway:
             ),
         )
 
-        self._subscriptions: list[Subscription] = []
-
         self._subscribe_all()
 
+    # =========================================================
+    # lifecycle helpers
+    # =========================================================
+
+    def _spawn(self, coro):
+        if self._closing:
+            return None
+
+        task = self._loop.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def stop(self):
+        self._closing = True
+
+        # stop subscriptions first
+        for sub in self._subscriptions:
+            try:
+                sub.destroy()
+            except Exception:
+                pass
+        self._subscriptions.clear()
+
+        # cancel async tasks
+        for task in list(self._tasks):
+            task.cancel()
+
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+    async def __aexit__(self, *exc):
+        await self.stop()
+
+    # =========================================================
+    # core utilities
+    # =========================================================
+
     async def call_service(self, client: rclpy.client.Client, req, timeout=1) -> Any:
-        """
-        Utility to wrap a ros service call in an awaitable,
-        raises HTTPException if service call fails.
-        """
         fut = client.call_async(req)
         try:
-            result = await asyncio.wait_for(fut, timeout=timeout)
-            return result
+            return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError as e:
             raise HTTPException(503, "ros service call timed out") from e
 
-    def _process_building_map(
-        self,
-        rmf_building_map: RmfBuildingMap,
-    ) -> BuildingMap:
-        """
-        1. Converts a `BuildingMap` message to an ordered dict.
-        2. Saves the images into `{cache_directory}/{map_name}/`.
-        3. Change the `AffineImage` `data` field to the url of the image.
-        """
+    def _process_building_map(self, rmf_building_map: RmfBuildingMap) -> BuildingMap:
         processed_map = message_to_ordereddict(rmf_building_map)
 
         for i, level in enumerate(rmf_building_map.levels):
-            level: RmfLevel
             for j, image in enumerate(level.images):
                 image = cast(RmfAffineImage, image)
-                # look at non-crypto hashes if we need more performance
-                sha1_hash = hashlib.sha1()
-                sha1_hash.update(image.data)
-                fingerprint = base64.b32encode(sha1_hash.digest()).lower().decode()
-                relpath = f"{rmf_building_map.name}/{level.name}-{image.name}.{fingerprint}.{image.encoding}"  # pylint: disable=line-too-long
-                urlpath = self._cached_files.add_file(cast(bytes, image.data), relpath)
+
+                sha1 = hashlib.sha1()
+                sha1.update(image.data)
+                fingerprint = base64.b32encode(sha1.digest()).lower().decode()
+
+                relpath = (
+                    f"{rmf_building_map.name}/"
+                    f"{level.name}-{image.name}.{fingerprint}.{image.encoding}"
+                )
+
+                urlpath = self._cached_files.add_file(image.data, relpath)
                 processed_map["levels"][i]["images"][j]["data"] = urlpath
+
         return BuildingMap(**processed_map)
 
+    # =========================================================
+    # subscriptions
+    # =========================================================
+
     def _subscribe_all(self):
+
         def handle_door_state(msg):
-            async def save(door_state: DoorState):
-                await self._rmf_repo.save_door_state(door_state)
-                self._rmf_events.door_states.on_next(door_state)
-                logging.debug("%s", door_state)
+            async def save(state: DoorState):
+                if self._closing:
+                    return
+                await self._rmf_repo.save_door_state(state)
+                self._rmf_events.door_states.on_next(state)
 
-            self._loop.create_task(save(DoorState.model_validate(msg)))
+            self._spawn(save(DoorState.model_validate(msg)))
 
-        door_states_sub = self._ros_node.create_subscription(
-            RmfDoorState,
-            "door_states",
-            handle_door_state,
-            100,
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                RmfDoorState, "door_states", handle_door_state, 100
+            )
         )
-        self._subscriptions.append(door_states_sub)
 
         def handle_lift_state(msg):
-            async def save(lift_state: LiftState):
-                await self._rmf_repo.save_lift_state(lift_state)
-                self._rmf_events.lift_states.on_next(lift_state)
-                logging.debug("%s", lift_state)
+            async def save(state: LiftState):
+                if self._closing:
+                    return
+                await self._rmf_repo.save_lift_state(state)
+                self._rmf_events.lift_states.on_next(state)
 
             dic = message_to_ordereddict(msg)
-            self._loop.create_task(save(LiftState(**dic)))
+            self._spawn(save(LiftState(**dic)))
 
-        lift_states_sub = self._ros_node.create_subscription(
-            RmfLiftState,
-            "lift_states",
-            handle_lift_state,
-            10,
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                RmfLiftState, "lift_states", handle_lift_state, 10
+            )
         )
-        self._subscriptions.append(lift_states_sub)
 
         def handle_dispenser_state(msg):
-            async def save(dispenser_state: DispenserState):
-                await self._rmf_repo.save_dispenser_state(dispenser_state)
-                self._rmf_events.dispenser_states.on_next(dispenser_state)
-                logging.debug("%s", dispenser_state)
+            async def save(state: DispenserState):
+                if self._closing:
+                    return
+                await self._rmf_repo.save_dispenser_state(state)
+                self._rmf_events.dispenser_states.on_next(state)
 
-            self._loop.create_task(save(DispenserState.model_validate(msg)))
+            self._spawn(save(DispenserState.model_validate(msg)))
 
-        dispenser_states_sub = self._ros_node.create_subscription(
-            RmfDispenserState,
-            "dispenser_states",
-            handle_dispenser_state,
-            10,
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                RmfDispenserState, "dispenser_states", handle_dispenser_state, 10
+            )
         )
-        self._subscriptions.append(dispenser_states_sub)
 
         def handle_ingestor_state(msg):
-            async def save(ingestor_state: IngestorState):
-                await self._rmf_repo.save_ingestor_state(ingestor_state)
-                self._rmf_events.ingestor_states.on_next(ingestor_state)
-                logging.debug("%s", ingestor_state)
+            async def save(state: IngestorState):
+                if self._closing:
+                    return
+                await self._rmf_repo.save_ingestor_state(state)
+                self._rmf_events.ingestor_states.on_next(state)
 
-            self._loop.create_task(save(IngestorState.model_validate(msg)))
+            self._spawn(save(IngestorState.model_validate(msg)))
 
-        ingestor_states_sub = self._ros_node.create_subscription(
-            RmfIngestorState,
-            "ingestor_states",
-            handle_ingestor_state,
-            10,
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                RmfIngestorState, "ingestor_states", handle_ingestor_state, 10
+            )
         )
-        self._subscriptions.append(ingestor_states_sub)
 
         def handle_building_map(msg):
-            async def save(building_map: BuildingMap):
-                await self._rmf_repo.save_building_map(building_map)
-                self._rmf_events.building_map.on_next(building_map)
-                logging.debug("%s", building_map)
+            async def save(bm: BuildingMap):
+                if self._closing:
+                    return
+                await self._rmf_repo.save_building_map(bm)
+                self._rmf_events.building_map.on_next(bm)
 
             bm = self._process_building_map(cast(RmfBuildingMap, msg))
-            self._loop.create_task(save(bm))
+            self._spawn(save(bm))
 
-        map_sub = self._ros_node.create_subscription(
-            RmfBuildingMap,
-            "map",
-            handle_building_map,
-            rclpy.qos.QoSProfile(
-                history=rclpy.qos.HistoryPolicy.KEEP_ALL,
-                depth=1,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-            ),
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                RmfBuildingMap,
+                "map",
+                handle_building_map,
+                rclpy.qos.QoSProfile(
+                    history=rclpy.qos.HistoryPolicy.KEEP_ALL,
+                    depth=1,
+                    reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                    durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
         )
-        self._subscriptions.append(map_sub)
 
         def handle_beacon_state(msg):
-            async def save(beacon_state: BeaconState):
-                await self._rmf_repo.save_beacon_state(beacon_state)
-                self._rmf_events.beacons.on_next(beacon_state)
-                logging.debug("%s", beacon_state)
+            async def save(state: BeaconState):
+                if self._closing:
+                    return
+                await self._rmf_repo.save_beacon_state(state)
+                self._rmf_events.beacons.on_next(state)
 
             msg = cast(RmfBeaconState, msg)
-            bs = BeaconState(
+            state = BeaconState(
                 id=msg.id,
                 online=msg.online,
                 category=msg.category,
                 activated=msg.activated,
                 level=msg.level,
             )
-            self._loop.create_task(save(bs))
 
-        beacon_sub = self._ros_node.create_subscription(
-            RmfBeaconState,
-            "beacon_state",
-            handle_beacon_state,
-            100,
-        )
-        self._subscriptions.append(beacon_sub)
+            self._spawn(save(state))
 
-        def handle_delivery_alert(msg):
-            msg = cast(RmfDeliveryAlert, msg)
-            da = DeliveryAlert(
-                id=msg.id,
-                category=DeliveryAlert.Category.from_rmf_value(msg.category.value),
-                tier=DeliveryAlert.Tier.from_rmf_value(msg.tier.value),
-                task_id=msg.task_id,
-                action=DeliveryAlert.Action.from_rmf_value(msg.action.value),
-                message=msg.message,
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                RmfBeaconState, "beacon_state", handle_beacon_state, 100
             )
-            self._rmf_events.delivery_alerts.on_next(da)
-            logging.debug("%s", da)
-
-        delivery_alert_request_sub = self._ros_node.create_subscription(
-            RmfDeliveryAlert,
-            "delivery_alert_request",
-            handle_delivery_alert,
-            rclpy.qos.QoSProfile(
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-                depth=10,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-            ),
         )
-        self._subscriptions.append(delivery_alert_request_sub)
 
+        # alerts
         def convert_alert(msg):
             alert = cast(RmfAlert, msg)
+
             tier = AlertRequest.Tier.Info
             if alert.tier == RmfAlert.TIER_WARNING:
                 tier = AlertRequest.Tier.Warning
             elif alert.tier == RmfAlert.TIER_ERROR:
                 tier = AlertRequest.Tier.Error
 
-            parameters = []
-            for p in alert.alert_parameters:
-                parameters.append(AlertParameter(name=p.name, value=p.value))
-
-            responses_available = cast(list[str], alert.responses_available)
             return AlertRequest(
                 id=alert.id,
                 unix_millis_alert_time=round(datetime.now().timestamp() * 1000),
@@ -344,151 +356,105 @@ class RmfGateway:
                 message=alert.message,
                 display=alert.display,
                 tier=tier,
-                responses_available=responses_available,
-                alert_parameters=parameters,
-                task_id=alert.task_id if len(alert.task_id) > 0 else None,
+                responses_available=list(alert.responses_available),
+                alert_parameters=[
+                    AlertParameter(name=p.name, value=p.value)
+                    for p in alert.alert_parameters
+                ],
+                task_id=alert.task_id or None,
             )
 
         def handle_alert(alert: AlertRequest):
-            async def create_alert(alert: AlertRequest):
+            async def create_alert(a: AlertRequest):
+                if self._closing:
+                    return
                 try:
-                    created_alert = await self._alert_repo.create_new_alert(alert)
-                except IntegrityError as e:
-                    logging.error("%s, %s", str(e), alert)
-                    return
-                except AlreadyExistsError as e:
-                    logging.error("%s, %s", str(e), alert)
-                    return
-                if not created_alert:
-                    logging.error("Failed to create alert: %s", alert)
+                    created = await self._alert_repo.create_new_alert(a)
+                except Exception as e:
+                    self._logger.error("%s", e)
                     return
 
-                self._alert_events.alert_requests.on_next(created_alert)
-                logging.debug("%s", alert)
+                self._alert_events.alert_requests.on_next(created)
 
-            logging.info(f"Received alert: {alert}")
-            self._loop.create_task(create_alert(alert))
+            self._spawn(create_alert(alert))
 
-        alert_sub = self._ros_node.create_subscription(
-            RmfAlert,
-            "alert",
-            lambda msg: handle_alert(convert_alert(msg)),
-            rclpy.qos.QoSProfile(
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-                depth=10,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-            ),
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                RmfAlert,
+                "alert",
+                lambda msg: handle_alert(convert_alert(msg)),
+                rclpy.qos.QoSProfile(
+                    history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                    depth=10,
+                    reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                    durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
         )
-        self._subscriptions.append(alert_sub)
 
-        # FIXME(ac): Due to also subscribing to alert responses, this callback
-        # gets triggered as well even if the response is called through REST,
-        # which publishes a ROS 2 message and gets picked up by this subscriber.
-        # This causes alert_repo.create_response to be called twice in total,
-        # resulting in a conflict of responses for the same alert ID. This does
-        # not cause any issues, just that an error log is produced.
         def handle_alert_response(msg):
-            msg = cast(RmfAlertResponse, msg)
-
-            async def create_response(alert_id: str, response: str):
+            async def create_response():
+                if self._closing:
+                    return
                 try:
-                    created_response = await self._alert_repo.create_response(
+                    created = await self._alert_repo.create_response(
                         msg.id, msg.response
                     )
-                except IntegrityError as e:
-                    logging.error(
-                        "%s, id: %s, response: %s", str(e), alert_id, response
-                    )
-                    return
-                except AlreadyExistsError as e:
-                    logging.error(
-                        "%s, id: %s, response: %s", str(e), alert_id, response
-                    )
-                    return
-                except NotFoundError as e:
-                    logging.error(
-                        "%s, id: %s, response: %s", str(e), alert_id, response
-                    )
-                    return
-                except InvalidInputError as e:
-                    logging.error(
-                        "%s, id: %s, response: %s", str(e), alert_id, response
-                    )
-                    return
-                if not created_response:
-                    logging.error(
-                        f"Failed to create alert response [{msg.response}] for alert id [{msg.id}]"
-                    )
+                except Exception as e:
+                    self._logger.error("%s", e)
                     return
 
-                self._alert_events.alert_responses.on_next(created_response)
-                logging.debug("%s", created_response)
+                self._alert_events.alert_responses.on_next(created)
 
-            logging.info(f"Received response [{msg.response}] for alert id [{msg.id}]")
-            self._loop.create_task(create_response(msg.id, msg.response))
+            self._spawn(create_response())
 
-        alert_response_sub = self._ros_node.create_subscription(
-            RmfAlertResponse,
-            "alert_response",
-            handle_alert_response,
-            rclpy.qos.QoSProfile(
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-                depth=10,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-            ),
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                RmfAlertResponse,
+                "alert_response",
+                lambda msg: handle_alert_response(msg),
+                rclpy.qos.QoSProfile(
+                    history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                    depth=10,
+                    reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                    durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
         )
-        self._subscriptions.append(alert_response_sub)
 
         def handle_fire_alarm_trigger(msg):
             msg = cast(BoolMsg, msg)
-            if msg.data:
-                logging.info("Fire alarm triggered")
-            else:
-                logging.info("Fire alarm trigger reset")
-            fire_alarm_trigger_state = FireAlarmTriggerState(
+
+            state = FireAlarmTriggerState(
                 unix_millis_time=round(datetime.now().timestamp() * 1000),
                 trigger=msg.data,
             )
-            self._rmf_events.fire_alarm_trigger.on_next(fire_alarm_trigger_state)
 
-        fire_alarm_trigger_sub = self._ros_node.create_subscription(
-            BoolMsg,
-            "fire_alarm_trigger",
-            handle_fire_alarm_trigger,
-            rclpy.qos.QoSProfile(
-                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
-                depth=10,
-                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-            ),
+            self._rmf_events.fire_alarm_trigger.on_next(state)
+
+        self._subscriptions.append(
+            self._ros_node.create_subscription(
+                BoolMsg,
+                "fire_alarm_trigger",
+                handle_fire_alarm_trigger,
+                10,
+            )
         )
-        self._subscriptions.append(fire_alarm_trigger_sub)
 
-    async def __aexit__(self, *exc):
-        for sub in self._subscriptions:
-            sub.destroy()
+    # =========================================================
+    # public API
+    # =========================================================
 
     def request_door(self, door_name: str, mode: int) -> None:
         msg = RmfDoorRequest(
             door_name=door_name,
             request_time=self._ros_node.get_clock().now().to_msg(),
-            requester_id=self._ros_node.get_name(),  # FIXME: use username
-            requested_mode=RmfDoorMode(
-                value=mode,
-            ),
+            requester_id=self._ros_node.get_name(),
+            requested_mode=RmfDoorMode(value=mode),
         )
         self._door_req.publish(msg)
 
-    def request_lift(
-        self,
-        lift_name: str,
-        destination: str,
-        request_type: int,
-        door_mode: int,
-        additional_session_ids: list[str],
-    ):
+    def request_lift(self, lift_name, destination, request_type, door_mode, additional):
         msg = RmfLiftRequest(
             lift_name=lift_name,
             request_time=self._ros_node.get_clock().now().to_msg(),
@@ -497,21 +463,14 @@ class RmfGateway:
             destination_floor=destination,
             door_state=door_mode,
         )
+
         self._adapter_lift_req.publish(msg)
 
-        for session_id in additional_session_ids:
-            msg.session_id = session_id
+        for sid in additional:
+            msg.session_id = sid
             self._adapter_lift_req.publish(msg)
 
-    def respond_to_delivery_alert(
-        self,
-        alert_id: str,
-        category: int,
-        tier: int,
-        task_id: str,
-        action: int,
-        message: str,
-    ):
+    def respond_to_delivery_alert(self, alert_id, category, tier, task_id, action, message):
         msg = RmfDeliveryAlert()
         msg.id = alert_id
         msg.category = RmfDeliveryAlertCategory(value=category)
@@ -527,12 +486,7 @@ class RmfGateway:
         msg.response = response
         self._alert_response.publish(msg)
 
-    def manual_release_mutex_groups(
-        self,
-        mutex_groups: list[str],
-        fleet: str,
-        robot: str,
-    ):
+    def manual_release_mutex_groups(self, mutex_groups, fleet, robot):
         msg = RmfMutexGroupManualRelease()
         msg.release_mutex_groups = mutex_groups
         msg.fleet = fleet
@@ -540,9 +494,9 @@ class RmfGateway:
         self._mutex_group_release.publish(msg)
 
     def reset_fire_alarm_trigger(self):
-        reset_msg = BoolMsg()
-        reset_msg.data = False
-        self._fire_alarm_trigger.publish(reset_msg)
+        msg = BoolMsg()
+        msg.data = False
+        self._fire_alarm_trigger.publish(msg)
 
 
 @singleton_dep
