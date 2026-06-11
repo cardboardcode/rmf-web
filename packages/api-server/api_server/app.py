@@ -259,7 +259,7 @@ async def redoc_html():
 async def _load_states(rmf_events: RmfEvents):
     default_logger.info("loading states from database...")
 
-    door_states = [DoorState.model_validate(x) for x in await ttm.DoorState.all()]
+    door_states = [DoorState.model_validate(x.data) for x in await ttm.DoorState.all()]
     for state in door_states:
         rmf_events.door_states.on_next(state)
     default_logger.info(f"loaded {len(door_states)} door states")
@@ -270,14 +270,14 @@ async def _load_states(rmf_events: RmfEvents):
     default_logger.info(f"loaded {len(lift_states)} lift states")
 
     dispenser_states = [
-        DispenserState.model_validate(x) for x in await ttm.DispenserState.all()
+        DispenserState.model_validate(x.data) for x in await ttm.DispenserState.all()
     ]
     for state in dispenser_states:
         rmf_events.dispenser_states.on_next(state)
     default_logger.info(f"loaded {len(dispenser_states)} dispenser states")
 
     ingestor_states = [
-        IngestorState.model_validate(x) for x in await ttm.IngestorState.all()
+        IngestorState.model_validate(x.data) for x in await ttm.IngestorState.all()
     ]
     for state in ingestor_states:
         rmf_events.ingestor_states.on_next(state)
