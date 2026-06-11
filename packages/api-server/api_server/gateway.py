@@ -33,7 +33,7 @@ from rmf_task_msgs.msg import Alert as RmfAlert
 from rmf_task_msgs.msg import AlertResponse as RmfAlertResponse
 from rosidl_runtime_py.convert import message_to_ordereddict
 from std_msgs.msg import Bool as BoolMsg
-from tortoise.exceptions import IntegrityError, ProgrammingError
+from tortoise.exceptions import IntegrityError
 
 from api_server.exceptions import AlreadyExistsError, InvalidInputError, NotFoundError
 from api_server.fast_io.singleton_dep import singleton_dep
