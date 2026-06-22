@@ -267,7 +267,6 @@ export const AppBar = React.memo(
           </Box>
           <Toolbar variant="dense">
             <Box display="flex" alignItems="center" gap={2}>
-              <Typography variant="subtitle1">Powered by Open-RMF</Typography>
               <Button
                 id="create-new-task-button"
                 aria-label="new task"
