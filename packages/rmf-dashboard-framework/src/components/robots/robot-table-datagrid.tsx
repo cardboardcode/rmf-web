@@ -166,10 +166,10 @@ export function RobotDataGridTable({ onRobotClick, robots }: RobotDataGridTableP
     <DataGrid
       getRowId={(r) => r.name}
       rows={robots}
-      pageSize={5}
+      pageSize={25}
       rowHeight={38}
       columns={columns}
-      rowsPerPageOptions={[5]}
+      rowsPerPageOptions={[5, 10, 25, 50, 100]}
       density={'standard'}
       onRowClick={handleEvent}
       initialState={{
@@ -177,7 +177,7 @@ export function RobotDataGridTable({ onRobotClick, robots }: RobotDataGridTableP
           sortModel: [{ field: 'name', sort: 'asc' }],
         },
       }}
-      disableVirtualization={true}
+      disableVirtualization={false}
     />
   );
 }
